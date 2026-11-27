@@ -1,7 +1,7 @@
 #Region ;**** Directives created by AutoIt3Wrapper_GUI ****
 #AutoIt3Wrapper_Icon=brainplay.ico
 #EndRegion ;**** Directives created by AutoIt3Wrapper_GUI ****
-;v4_optiline 18.10.2026
+;v5_ffline 27.11.2026
 #include <GUIConstantsEx.au3>
 #include <WindowsConstants.au3>
 #include <StaticConstants.au3>
@@ -9,6 +9,8 @@
 #include <EditConstants.au3>
 #include <Array.au3>
 #include <Math.au3>
+#include <Date.au3>
+#include <File.au3>
 #include <TrayConstants.au3>
 #include <StructureConstants.au3>
 #include <WinAPISys.au3>
@@ -54,6 +56,12 @@ Global $fPL = (IniRead($sIni, "player", "plist", "1") = "1"), $fCurOn = True, $i
 ; Video engine order: MCI first (light, uses installed codecs). Only if MCI can't play a video, the Windows Media Player control
 ; is created (lazily, on first need) inside the video window as a backup. Audio never touches WMP.
 Global $oWMP = 0, $idWMP = 0, $fWmp = False, $iWInit = 0
+; --- optional external engine: ffplay (downloaded into %APPDATA%\BrAiNPlay\ffmpeg, refreshed every 30 days) ---
+; MCI stays as it is. With the option on and ffplay.exe present, ffplay plays everything (audio: hidden, video: its window sits inside our video window)
+Global $fFF = (IniRead($sIni, "ffplay", "enabled", "0") = "1"), $sFFDir = $sApp & "\ffmpeg", $sFFPlay = $sFFDir & "\ffplay.exe"
+Global $aFFUrl[2] = [IniRead($sIni, "ffplay", "url", "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"), "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"]
+Global $iFFPid = 0, $hFF = 0, $fFFrun = False, $fFFWait = False, $sFFFile = "", $iFFw = 0, $iFFh = 0, $iFFV = 0, $iFFB = 0, $tFFSeek = 0, $tFFVol = 0, $iFFWw = 0, $iFFWh = 0, $sFFMode = "", $sFFWant = "", $tFFChg = 0, $sFFKeys = ""
+Global $iFFDl = 0, $hFFDl = 0, $iFFProc = 0, $iFFTry = 0, $sFFStat = "", $sFFNew = ""
 _Log("start | " & ($fWine ? "WINE | " : "") & "WMP installed: " & (RegRead("HKEY_CLASSES_ROOT\WMPlayer.OCX\CLSID", "") <> "" ? "yes" : "NO") & " | AutoIt " & @AutoItVersion & (@AutoItX64 ? " x64" : " x86") & " | OS " & @OSVersion & " " & @OSArch)
 
 Global $hMain = GUICreate("BrAiNPlay", 480, 540, -1, -1, $WS_POPUP, $WS_EX_ACCEPTFILES)
@@ -142,6 +150,7 @@ GUISetState(@SW_SHOW, $hMain)
 _Apply()
 If $fSavePL And FileExists($sLast) Then _LoadList($sLast)
 _MqInit()
+_FFAuto()
 Local $tUI = TimerInit(), $s, $a, $c, $f, $m
 While 1
 	$m = GUIGetMsg(1) ; advanced mode: $m[0] = event, $m[1] = window the event came from
@@ -277,6 +286,7 @@ While 1
 		_Tick()
 		_Hover()
 		_MqPoll()
+		_FFDlPoll()
 		$tUI = TimerInit()
 	EndIf
 WEnd
@@ -326,6 +336,11 @@ Func _Open($f) ; open + play, True if no error. MCI first; a video MCI can't pla
 	If IsObj($oWMP) Then $oWMP.fullScreen = False ; leave WMP's own fullscreen (it is entered again for the next WMP video if wanted)
 	_Mci("close bp")
 	$fEmb = False
+	_FFKill()
+	If _FFReady() Then
+		If _OpenFF($f, 0) Then Return True
+		_Log("ffplay did not start, using MCI: " & $f)
+	EndIf
 	Local $vid = _IsVid($f), $c = 'open "' & $f & '" alias bp', $e
 	If $vid Then
 		_Log("video via MCI: " & $f)
@@ -407,7 +422,17 @@ EndFunc
 Func _PlayPause()
 	If $fPlay Then
 		$fPause = Not $fPause
-		If $fWmp Then
+		If $fFFrun Then
+			If $fPause Then
+				If $fVid Then
+					_FFKillProc() ; video: pausing a process that owns a child window would hang our GUI -> stop it, restart at the same spot on resume
+				Else
+					_FFSusp(True)
+				EndIf
+			ElseIf $iFFPid Then
+				_FFSusp(False)
+			EndIf
+		ElseIf $fWmp Then
 			If $fPause Then
 				$oWMP.controls.pause()
 			Else
@@ -420,6 +445,7 @@ Func _PlayPause()
 			$iOff += TimerDiff($tRun) / 1000
 		Else
 			$tRun = TimerInit()
+			If $fFFrun And (Not $iFFPid Or $iVol <> $iFFV Or $iBal <> $iFFB) Then _FFLaunch($iOff)
 		EndIf
 		GUICtrlSetData($bPlay, $fPause ? ">" : "||")
 	Else
@@ -430,11 +456,23 @@ EndFunc
 
 Func _Pos() ; own clock (MCI's position/length are unreliable for some mp3s): offset set on play/seek + time since
 	If $fWmp Then Return Number($oWMP.controls.currentPosition) ; WMP knows the real position
-	Return $fPause ? $iOff : $iOff + TimerDiff($tRun) / 1000
+	Return ($fPause Or $fFFWait) ? $iOff : $iOff + TimerDiff($tRun) / 1000
 EndFunc
 
 Func _Seek($f) ; $f = 0..1
 	If Not $fPlay Or $iLen <= 0 Then Return
+	If $fFFrun Then ; ffplay can't seek from outside: stop it, restart at the new spot shortly after the last request
+		_FFKillProc()
+		$iOff = $f * $iLen
+		$tRun = TimerInit()
+		$fFFWait = True
+		$tFFSeek = TimerInit()
+		$tCmd = TimerInit()
+		$fPause = False
+		GUICtrlSetData($bPlay, "||")
+		_Tick()
+		Return
+	EndIf
 	If $fWmp Then
 		$oWMP.controls.currentPosition = $f * $iLen
 		$oWMP.controls.play()
@@ -462,6 +500,7 @@ Func _Skip($d) ; seek relative, seconds
 EndFunc
 
 Func _Stop()
+	_FFKill()
 	If $fWmp Then $oWMP.controls.stop()
 	$fWmp = False
 	If $idWMP Then GUICtrlSetState($idWMP, $GUI_HIDE)
@@ -548,7 +587,17 @@ Func _Tick()
 	EndIf
 	If Not $fPlay Or $fPause Then Return
 	Local $m, $ended
-	If $fWmp Then ; playState: 3 playing, 2 paused, 6/7/9 loading, 8 ended, 1 stopped, 10 ready
+	If $fFFrun Then
+		If $fFFWait And TimerDiff($tFFSeek) > 150 Then _FFLaunch($iOff)
+		If $fFFWait Then
+			$ended = False
+		ElseIf $iVol <> $iFFV Or $iBal <> $iFFB Then ; volume / balance are command line options of ffplay -> restart at the current position once the slider is released
+			If $iDrag = 0 And TimerDiff($tFFVol) > 350 Then _FFRestart()
+			$ended = False
+		Else
+			$ended = Not ProcessExists($iFFPid)
+		EndIf
+	ElseIf $fWmp Then ; playState: 3 playing, 2 paused, 6/7/9 loading, 8 ended, 1 stopped, 10 ready
 		$m = Number($oWMP.playState)
 		If $m <> $iWSt Then
 			$iWSt = $m
@@ -573,7 +622,38 @@ Func _Tick()
 		EndIf
 		Return
 	EndIf
-	If $fVid And $iVSz = 0 And TimerDiff($tStart) > 800 And (Not $fWmp Or $m = 3) Then ; video size is known by now (WMP: playing) -> fit it / WMP: go fullscreen
+	If $fFFrun And $fVid And $hFF And Not $fFFWait And $sFFMode <> "" Then ; fullscreen <-> window (or another monitor): the picture is scaled by ffplay -> restart with the matching command line
+		Local $wm = _FFWantMode()
+		If $wm <> $sFFMode Then
+			If $wm <> $sFFWant Then ; wait until the user stopped pressing + / -
+				$sFFWant = $wm
+				$tFFChg = TimerInit()
+			ElseIf TimerDiff($tFFChg) > 400 Then
+				$sFFWant = ""
+				_FFRestart()
+				Return
+			EndIf
+		Else
+			$sFFWant = ""
+		EndIf
+	EndIf
+	If $fFFrun And $fVid And $hFF And $iFFWw > 0 And $fVidShown Then ; ffplay may resize itself after the embed -> put it back
+		Local $cz = WinGetClientSize($hFF)
+		If IsArray($cz) Then
+			If $cz[0] <> $iFFWw Or $cz[1] <> $iFFWh Then _FFSize()
+		EndIf
+	EndIf
+	If $fFFrun And $fVid And Not $hFF And Not $fFFWait Then ; ffplay's window shows up a moment after the start (and after every seek)
+		If _FFEmbed() Then
+			_VideoSize()
+			If $iVSz = 0 And $fFull And $fVidOn Then _Osd($sNow, 4000)
+			$iVSz = 1
+		ElseIf TimerDiff($tCmd) > 8000 Then ; no picture at all (audio-only file with a video extension)
+			$fVid = False
+			_VidApply()
+		EndIf
+	EndIf
+	If $fVid And $iVSz = 0 And Not $fFFrun And TimerDiff($tStart) > 800 And (Not $fWmp Or $m = 3) Then ; video size is known by now (WMP: playing) -> fit it / WMP: go fullscreen
 		$iVSz = 1
 		_VideoSize()
 		If $fFull And Not $fWmp Then _Osd($sNow, 4000) ; track title over the fullscreen video (WMP: when it enters fullscreen)
@@ -642,7 +722,9 @@ Func _Apply()
 	If $iBal > 0 Then $l = $v * (100 - $iBal) / 100
 	If $iBal < 0 Then $r = $v * (100 + $iBal) / 100
 	If $fPlay Then
-		If $fWmp Then
+		If $fFFrun Then
+			$tFFVol = TimerInit() ; ffplay: applied by a restart (see _Tick)
+		ElseIf $fWmp Then
 			$oWMP.settings.volume = $iVol
 			$oWMP.settings.balance = $iBal
 		ElseIf $iBal = 0 Then
@@ -931,6 +1013,7 @@ Func _VidApply() ; TV button + video window follow: current track is a video? vi
 		_Cursor(True)
 		_KeepAwake(False)
 	EndIf
+	_FFKeys()
 	GUISwitch($hMain)
 EndFunc
 
@@ -1125,6 +1208,16 @@ EndFunc
 
 Func _AudioTrack() ; A: next audio track (WMP: its audio languages; the MCI driver has no track selection)
 	If Not ($fPlay And $fVid) Then Return
+	If $fFFrun Then ; ffplay's own key "a" = next audio stream (posted to its window)
+		If $hFF Then
+			DllCall("user32.dll", "bool", "PostMessageW", "hwnd", $hFF, "uint", 0x100, "wparam", 0x41, "lparam", 0x001E0001)
+			DllCall("user32.dll", "bool", "PostMessageW", "hwnd", $hFF, "uint", 0x101, "wparam", 0x41, "lparam", 0xC01E0001)
+			_Note("audio: next track")
+		Else
+			_Note("audio track: video window not ready")
+		EndIf
+		Return
+	EndIf
 	If Not $fWmp Then
 		_Note("audio track selection is not available in MCI mode")
 		Return
@@ -1254,7 +1347,11 @@ Func _OverVideo($bClient = False) ; is the mouse over the (visible, not covered)
 	DllStructSetData($t, "Y", $m[1])
 	Local $h = _WinAPI_WindowFromPoint($t)
 	If Not $h Then Return False
-	If $bClient And $h = $hVid Then Return False
+	If $bClient And $h = $hVid Then
+		If Not $hFF Then Return False
+		Local $pf = WinGetPos($hFF) ; ffplay's window is disabled (clicks fall through to the host) -> "picture" = its rectangle
+		Return IsArray($pf) And $m[0] >= $pf[0] And $m[0] < $pf[0] + $pf[2] And $m[1] >= $pf[1] And $m[1] < $pf[1] + $pf[3]
+	EndIf
 	Return _WinAPI_GetAncestor($h, 2) = $hVid ; GA_ROOT
 EndFunc
 
@@ -1276,6 +1373,7 @@ EndFunc
 
 Func _VideoSize() ; MCI: fullscreen = picture letterboxed into the monitor | window = client area gets the video's size. WMP: fullscreen is its own
 	If Not ($fPlay And $fVid) Then Return
+	If $fFFrun Then Return _FFSize()
 	If $fWmp Then
 		$oWMP.stretchToFit = True
 		If $fVidOn And $iVSz >= 1 Then
@@ -1319,6 +1417,337 @@ Func _VideoSize() ; MCI: fullscreen = picture letterboxed into the monitor | win
 	$x = Int(($z[0] - $w) / 2)
 	$y = Int(($z[1] - $h) / 2)
 	_Mci("put bp window at " & $x & " " & $y & " " & $w & " " & $h)
+EndFunc
+
+; ================= external engine: ffplay =================
+Func _FFReady() ; option on + ffplay.exe present
+	Return $fFF And FileExists($sFFPlay)
+EndFunc
+
+Func _OpenFF($f, $pos) ; True if ffplay started
+	$sFFFile = $f
+	$fFFrun = True
+	$fEmb = _IsVid($f) And Not $fWine ; (Wine: audio only, the SDL window can't be embedded there)
+	$iFFw = 0
+	$iFFh = 0
+	$iZoom = 100 ; (a new track starts unzoomed anyway)
+	$sFFWant = ""
+	Return _FFLaunch($pos)
+EndFunc
+
+Func _FFLaunch($pos) ; (re)start ffplay at $pos seconds with the current volume / balance
+	_FFKillProc()
+	$sFFMode = _FFWantMode()
+	Local $vid = _IsVid($sFFFile) And Not $fWine, $c = '"' & $sFFPlay & '" -hide_banner -loglevel quiet -nostats -autoexit -volume ' & $iVol
+	If $pos > 0.05 Then $c &= " -ss " & StringFormat("%.2f", $pos)
+	If $iBal <> 0 Then $c &= ' -af "aformat=channel_layouts=stereo,pan=stereo|c0=' & StringFormat("%.2f", $iBal > 0 ? (100 - $iBal) / 100 : 1) & "*c0|c1=" & StringFormat("%.2f", $iBal < 0 ? (100 + $iBal) / 100 : 1) & '*c1"'
+	If $vid Then
+		$c &= " -noborder -left -32000 -top -32000 -window_title BrAiNPlayFF" ; starts off-screen, we move it into the video window
+		If $sFFMode <> "W" Then ; fullscreen / zoom: ffplay scales (+ crops / letterboxes) the picture itself to the host size - resizing its window alone is unreliable
+			Local $fw, $fh, $mr, $zs
+			If $fFull Then
+				$mr = _VidMonitor()
+				$fw = $mr[2]
+				$fh = $mr[3]
+			Else
+				$zs = WinGetClientSize($hVid)
+				$fw = IsArray($zs) ? $zs[0] : $iFFw
+				$fh = IsArray($zs) ? $zs[1] : $iFFh
+			EndIf
+			Local $zw = Int($fw * $iZoom / 100), $zh = Int($fh * $iZoom / 100)
+			$c &= " -x " & $fw & " -y " & $fh & ' -vf "scale=iw*sar:ih,setsar=1,scale=' & $zw & ":" & $zh & ":force_original_aspect_ratio=decrease,crop='min(iw," & $fw & ")':'min(ih," & $fh & ")',pad=" & $fw & ":" & $fh & ':(ow-iw)/2:(oh-ih)/2:black"'
+		EndIf
+	Else
+		$c &= " -nodisp -vn"
+	EndIf
+	$c &= ' -i "' & $sFFFile & '"'
+	_Dbg("ffplay: " & $c)
+	$iFFPid = Run($c, $sFFDir, @SW_HIDE)
+	If Not $iFFPid Then
+		_Log("ffplay: cannot start " & $sFFPlay)
+		$fFFrun = False
+		$fFFWait = False
+		Return False
+	EndIf
+	$iFFV = $iVol
+	$iFFB = $iBal
+	$fFFWait = False
+	$iOff = _Max($pos - 0.3, 0) ; (start-up takes a moment)
+	$tRun = TimerInit()
+	$tCmd = TimerInit()
+	Return True
+EndFunc
+
+Func _FFKeys() ; ffplay video visible: our keys as global hotkeys, so they work without focus and never reach ffplay (its Esc / q would quit it = next track).
+	; fullscreen: all player keys | window: only the zoom keys (the rest would block typing in other programs)
+	Local $w = ""
+	If $fFFrun And $fVid And $fVidShown And Not $fTray Then
+		$w = "{+}|{NUMPADADD}|-|{NUMPADSUB}|0"
+		If $fFull Then $w &= "|{SPACE}|{LEFT}|{RIGHT}|{UP}|{DOWN}|^{UP}|^{DOWN}|n|p|s|m|f|w|a|d|{ESC}"
+	EndIf
+	If $w = $sFFKeys Then Return
+	Local $k, $i
+	If $sFFKeys <> "" Then
+		$k = StringSplit($sFFKeys, "|", 2)
+		For $i = 0 To UBound($k) - 1
+			HotKeySet($k[$i])
+		Next
+	EndIf
+	$sFFKeys = $w
+	If $w = "" Then Return
+	$k = StringSplit($w, "|", 2)
+	For $i = 0 To UBound($k) - 1
+		HotKeySet($k[$i], _FFKeyFn($k[$i]))
+	Next
+EndFunc
+
+Func _FFKeyFn($k)
+	Switch $k
+		Case "{+}", "{NUMPADADD}"
+			Return "_HkZI"
+		Case "-", "{NUMPADSUB}"
+			Return "_HkZO"
+		Case "0"
+			Return "_HkZ0"
+		Case "{SPACE}"
+			Return "_PlayPause"
+		Case "{LEFT}"
+			Return "_HkBack"
+		Case "{RIGHT}"
+			Return "_HkFwd"
+		Case "{UP}", "^{UP}"
+			Return "_HkVU"
+		Case "{DOWN}", "^{DOWN}"
+			Return "_HkVD"
+		Case "n"
+			Return "_HkNext"
+		Case "p"
+			Return "_Prev"
+		Case "s"
+			Return "_Stop"
+		Case "m"
+			Return "_Mute"
+		Case "f"
+			Return "_HkF"
+		Case "w"
+			Return "_HkW"
+		Case "a"
+			Return "_AudioTrack"
+		Case "d"
+			Return "_NextMonitor"
+	EndSwitch
+	Return "_HkEsc" ; {ESC}
+EndFunc
+
+Func _HkZI()
+	_Zoom(10)
+EndFunc
+
+Func _HkZO()
+	_Zoom(-10)
+EndFunc
+
+Func _HkZ0()
+	_Zoom(0)
+EndFunc
+
+Func _HkW()
+	_VidKey("w")
+EndFunc
+
+Func _FFWantMode() ; command line variant the current state needs: W = plain window | F... = fullscreen (monitor size) | WZ... = window with zoom
+	If $fFull Then
+		Local $m = _VidMonitor()
+		Return "F" & $m[2] & ":" & $m[3] & "Z" & $iZoom
+	EndIf
+	If $iZoom <> 100 And $iFFw > 0 Then Return "WZ" & $iZoom
+	Return "W"
+EndFunc
+
+Func _FFRestart()
+	_FFLaunch(_Pos())
+EndFunc
+
+Func _FFKillProc()
+	If $iFFPid Then ProcessClose($iFFPid)
+	$iFFPid = 0
+	$hFF = 0
+EndFunc
+
+Func _FFKill()
+	_FFKillProc()
+	$fFFrun = False
+	$fFFWait = False
+EndFunc
+
+Func _FFSusp($on) ; pause an audio-only ffplay (no window, so nothing can hang on it)
+	If Not $iFFPid Then Return
+	Local $h = DllCall("kernel32.dll", "handle", "OpenProcess", "dword", 0x0800, "bool", False, "dword", $iFFPid)
+	If @error Or Not IsArray($h) Then Return
+	If Not $h[0] Then Return
+	DllCall("ntdll.dll", "long", $on ? "NtSuspendProcess" : "NtResumeProcess", "handle", $h[0])
+	DllCall("kernel32.dll", "bool", "CloseHandle", "handle", $h[0])
+EndFunc
+
+Func _FFEmbed() ; find ffplay's SDL window, make it a disabled child of the video window
+	Local $a = WinList("[TITLE:BrAiNPlayFF]"), $h = 0
+	For $i = 1 To $a[0][0]
+		If WinGetProcess($a[$i][1]) = $iFFPid Then
+			$h = $a[$i][1]
+			ExitLoop
+		EndIf
+	Next
+	If Not $h Then Return False
+	If Not BitAND(WinGetState($h), 2) Then Return False ; ffplay creates the window hidden and shows + sizes it (to the video) with the first frame -> embed only then, else it resizes itself afterwards
+	Local $p = WinGetPos($h)
+	If IsArray($p) And $p[2] > 16 And $iFFw = 0 And $sFFMode = "W" Then
+		$iFFw = $p[2] ; native video size (for the window mode)
+		$iFFh = $p[3]
+	EndIf
+	_WinAPI_SetWindowLong($h, -16, BitOR($WS_CHILD, $WS_VISIBLE, $WS_DISABLED)) ; disabled: no mouse / keys reach ffplay, clicks fall through to our video window
+	_WinAPI_SetParent($h, $hVid)
+	DllCall("user32.dll", "bool", "SetWindowPos", "hwnd", $h, "hwnd", 0, "int", 0, "int", 0, "int", 0, "int", 0, "uint", 0x37)
+	$hFF = $h
+	$iFFWw = 0
+	Return True
+EndFunc
+
+Func _FFSize() ; fullscreen: the picture fills the host window (SDL letterboxes) | window: host gets the video's size | zoom: bigger than the host = cropped
+	If Not $hFF Then Return
+	Local $z = WinGetClientSize($hVid), $w, $h, $k
+	If Not IsArray($z) Then Return
+	If $z[0] < 2 Or $z[1] < 2 Then Return
+	$w = $z[0]
+	$h = $z[1]
+	If Not $fFull Then
+		Local $mr = _VidMonitor(), $cw = $iFFw > 0 ? $iFFw : 640, $ch = $iFFh > 0 ? $iFFh : 360
+		$k = _Min(1, _Min($mr[2] * 0.9 / $cw, $mr[3] * 0.9 / $ch))
+		$cw = Int($cw * $k)
+		$ch = Int($ch * $k)
+		If $sWin <> $cw & "x" & $ch Then
+			$sWin = $cw & "x" & $ch
+			Local $ps = WinGetPos($hVid)
+			If IsArray($ps) Then
+				WinMove($hVid, "", $mr[0] + Int(($mr[2] - $cw - ($ps[2] - $z[0])) / 2), $mr[1] + Int(($mr[3] - $ch - ($ps[3] - $z[1])) / 2), $cw + ($ps[2] - $z[0]), $ch + ($ps[3] - $z[1]))
+			EndIf
+			$z = WinGetClientSize($hVid)
+			If Not IsArray($z) Then Return
+		EndIf
+		$w = $z[0]
+		$h = $z[1]
+	EndIf
+	$iFFWw = $w
+	$iFFWh = $h
+	DllCall("user32.dll", "bool", "SetWindowPos", "hwnd", $hFF, "hwnd", 0, "int", Int(($z[0] - $w) / 2), "int", Int(($z[1] - $h) / 2), "int", $w, "int", $h, "uint", 0x54) ; NOZORDER | NOACTIVATE | SHOWWINDOW
+	Local $cs = WinGetClientSize($hFF)
+	_Dbg("ffplay size: want " & $w & "x" & $h & " | host " & $z[0] & "x" & $z[1] & " | child now " & (IsArray($cs) ? $cs[0] & "x" & $cs[1] : "?"))
+EndFunc
+
+; --- ffplay download (background, like MultiDL): zip -> tar / PowerShell -> ffplay.exe; refreshed every 30 days ---
+Func _FFAuto() ; at start: option on and ffplay missing or older than 30 days -> download
+	If Not $fFF Then Return
+	Local $d = IniRead($sIni, "ffplay", "updated", "")
+	If Not FileExists($sFFPlay) Or Not StringRegExp($d, "^\d{4}/\d\d/\d\d$") Or _DateDiff("D", $d, _NowCalcDate()) >= 30 Then _FFDownload()
+EndFunc
+
+Func _FFDownload()
+	If $iFFDl Then Return
+	DirCreate($sFFDir)
+	FileDelete($sFFDir & "\ff.zip")
+	$iFFTry = 0
+	_FFDlStart()
+EndFunc
+
+Func _FFDlStart()
+	$hFFDl = InetGet($aFFUrl[$iFFTry], $sFFDir & "\ff.zip", 1, 1) ; force reload, background
+	$iFFDl = 1
+	$sFFStat = "downloading ..."
+	_Log("ffplay: download " & $aFFUrl[$iFFTry])
+EndFunc
+
+Func _FFDlFail($t)
+	$iFFDl = 0
+	$sFFStat = $t
+	_Log("ffplay: " & $t)
+	DirRemove($sFFDir & "\tmp", 1)
+	FileDelete($sFFDir & "\ff.zip")
+EndFunc
+
+Func _FFFound() ; path of the extracted ffplay.exe or ""
+	Local $a = _FileListToArrayRec($sFFDir & "\tmp", "ffplay.exe", 1, 1, 0, 2)
+	If @error Or Not IsArray($a) Then Return ""
+	Return $a[1]
+EndFunc
+
+Func _FFDlPoll() ; every 200 ms
+	If Not $iFFDl Then Return
+	Local $t, $b, $ok, $z = $sFFDir & "\ff.zip", $x = $sFFDir & "\tmp"
+	Switch $iFFDl
+		Case 1 ; downloading
+			If Not InetGetInfo($hFFDl, 2) Then
+				$t = InetGetInfo($hFFDl, 1)
+				$b = InetGetInfo($hFFDl, 0)
+				$sFFStat = "downloading " & ($t > 0 ? Int($b / $t * 100) & " %" : Round($b / 1048576) & " MB")
+				Return
+			EndIf
+			$ok = InetGetInfo($hFFDl, 3)
+			InetClose($hFFDl)
+			If Not $ok Then
+				If $iFFTry + 1 < UBound($aFFUrl) Then ; second source
+					$iFFTry += 1
+					_FFDlStart()
+				Else
+					_FFDlFail("download failed (retry at next start or with UPDATE)")
+				EndIf
+				Return
+			EndIf
+			DirRemove($x, 1)
+			DirCreate($x)
+			$iFFProc = Run('tar -xf "' & $z & '" -C "' & $x & '"', "", @SW_HIDE)
+			$iFFDl = 2
+			$sFFStat = "extracting ..."
+		Case 2 ; tar
+			If $iFFProc And ProcessExists($iFFProc) Then Return
+			$sFFNew = _FFFound()
+			If $sFFNew <> "" Then
+				$iFFDl = 4
+			Else ; no tar (old Windows / Wine) -> PowerShell
+				$iFFProc = Run('powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath ''' & $z & ''' -DestinationPath ''' & $x & ''' -Force"', "", @SW_HIDE)
+				$iFFDl = 3
+			EndIf
+		Case 3 ; PowerShell
+			If $iFFProc And ProcessExists($iFFProc) Then Return
+			$sFFNew = _FFFound()
+			If $sFFNew = "" Then
+				_FFDlFail("extracting failed (no ffplay.exe in the archive)")
+			Else
+				$iFFDl = 4
+			EndIf
+		Case 4 ; swap in the new ffplay.exe (not while the old one is playing)
+			If $iFFPid And ProcessExists($iFFPid) And FileExists($sFFPlay) Then
+				$sFFStat = "update ready, waiting for the playback to stop"
+				Return
+			EndIf
+			If FileMove($sFFNew, $sFFPlay, 1) Then
+				IniWrite($sIni, "ffplay", "updated", _NowCalcDate())
+				DirRemove($x, 1)
+				FileDelete($z)
+				$iFFDl = 0
+				$sFFStat = ""
+				_Log("ffplay: installed / updated")
+			Else
+				_FFDlFail("could not replace ffplay.exe")
+			EndIf
+	EndSwitch
+EndFunc
+
+Func _FFStatText() ; line for the options window
+	If $iFFDl Then Return "ffplay: " & $sFFStat
+	If FileExists($sFFPlay) Then
+		Local $d = IniRead($sIni, "ffplay", "updated", "")
+		Return "ffplay: ready" & ($d <> "" ? " (updated " & $d & ")" : "") & ($fFF ? "" : " - switched off")
+	EndIf
+	Return "ffplay: " & ($sFFStat <> "" ? $sFFStat : "not installed")
 EndFunc
 
 ; ================= helpers =================
@@ -1394,6 +1823,10 @@ EndFunc
 
 Func _Quit()
 	_MqQuit()
+	_FFKill()
+	$fFFrun = False
+	_FFKeys()
+	If $iFFDl = 1 Then InetClose($hFFDl)
 	_WmpKeys(False)
 	_Cursor(True)
 	_KeepAwake(False)
@@ -1904,7 +2337,10 @@ Func _Options() ; settings window (general, video, MQTT); the player keeps runni
 	_TogAdd("Remember the playlist", 20, 186, $fSavePL)
 	_OptLbl("VIDEO", 20, 234, 300, $ACC)
 	_TogAdd("Click on video: fullscreen / window", 20, 262, $fClick)
-	Local $bLog = _B("OPEN LOG", 20, 330, 150, 32, $TXT, 9), $bDir = _B("OPEN FOLDER", 180, 330, 150, 32, $TXT, 9)
+	_OptLbl("FFPLAY", 20, 300, 300, $ACC)
+	_TogAdd("Use external ffplay components", 20, 326, $fFF)
+	Local $lFF = _OptLbl("", 20, 356, 330)
+	Local $bLog = _B("OPEN LOG", 20, 402, 100, 36, $TXT, 9), $bDir = _B("OPEN FOLDER", 126, 402, 110, 36, $TXT, 9), $bUpd = _B("UPDATE FFPLAY", 242, 402, 108, 36, $TXT, 9)
 	; --- right: MQTT ---
 	_OptLbl("MQTT  (Home Assistant & co.)", 370, 56, 330, $ACC)
 	_TogAdd("Enabled", 370, 84, IniRead($sIni, "mqtt", "enabled", "0") = "1")
@@ -1922,7 +2358,7 @@ Func _Options() ; settings window (general, video, MQTT); the player keeps runni
 	_OptLbl("HA prefix", 370, 330, 90)
 	Local $ePre = _OptInp($sMqPre, 460, 330, 240)
 	Local $lSt = _OptLbl("", 370, 364, 330)
-	Local $bApply = _B("SAVE", 370, 402, 160, 36, $ACC, 10), $bClose2 = _B("CLOSE", 540, 402, 160, 36, $TXT, 10)
+	Local $bApply = _B("SAVE", 370, 402, 160, 36, $ACC, 10), $bClose2 = _B("CANCEL", 540, 402, 160, 36, $TXT, 10)
 	Local $kEsc2 = GUICtrlCreateDummy(), $aE[1][2] = [["{ESC}", $kEsc2]]
 	GUISetAccelerators($aE, $hOpt)
 	GUISetState(@SW_SHOW, $hOpt)
@@ -1938,6 +2374,8 @@ Func _Options() ; settings window (general, video, MQTT); the player keeps runni
 					ShellExecute("notepad.exe", '"' & $sApp & '\brainplay.log"')
 				Case $bDir
 					ShellExecute($sApp)
+				Case $bUpd
+					_FFDownload()
 				Case $bApply
 					$fLog = ($aTs[0] = 1)
 					$fMKeys = ($aTs[1] = 1)
@@ -1949,23 +2387,27 @@ Func _Options() ; settings window (general, video, MQTT); the player keeps runni
 					IniWrite($sIni, "general", "keepawake", $fKeepAw ? "1" : "0")
 					IniWrite($sIni, "general", "saveplaylist", $fSavePL ? "1" : "0")
 					IniWrite($sIni, "video", "clickmode", $fClick ? "1" : "0")
+					$fFF = ($aTs[5] = 1)
+					IniWrite($sIni, "ffplay", "enabled", $fFF ? "1" : "0")
+					_FFAuto() ; switched on: download now if ffplay is missing / old
 					_MediaKeys($fMKeys)
 					If Not $fKeepAw Then _KeepAwake(False)
 					$pt = Int(GUICtrlRead($ePort))
 					If $pt < 1 Or $pt > 65535 Then $pt = 1883
-					IniWrite($sIni, "mqtt", "enabled", $aTs[5] = 1 ? "1" : "0")
+					IniWrite($sIni, "mqtt", "enabled", $aTs[6] = 1 ? "1" : "0")
 					IniWrite($sIni, "mqtt", "host", StringStripWS(GUICtrlRead($eHost), 3))
 					IniWrite($sIni, "mqtt", "port", $pt)
 					IniWrite($sIni, "mqtt", "user", GUICtrlRead($eUser))
 					_PassWrite(GUICtrlRead($ePass))
 					IniWrite($sIni, "mqtt", "base", StringStripWS(GUICtrlRead($eBase), 3))
-					IniWrite($sIni, "mqtt", "discovery", $aTs[6] = 1 ? "1" : "0")
+					IniWrite($sIni, "mqtt", "discovery", $aTs[7] = 1 ? "1" : "0")
 					IniWrite($sIni, "mqtt", "discovery_prefix", StringStripWS(GUICtrlRead($ePre), 3))
 					_MqQuit() ; reconnect with the new settings
 					$fMq = False
 					_MqInit()
 					GUICtrlSetData($ePort, $iMqPort)
 					_Log("options applied")
+					$done = True ; SAVE saves everything and closes the window
 				Case Else
 					For $i = 0 To UBound($aTs) - 1
 						If $m[0] = $aTp[$i] Or $m[0] = $aTc[$i] Then
@@ -1979,6 +2421,8 @@ Func _Options() ; settings window (general, video, MQTT); the player keeps runni
 			$tT = TimerInit()
 			_Tick()
 			_MqPoll()
+			_FFDlPoll()
+			GUICtrlSetData($lFF, _FFStatText())
 			If $fVidShown Then _VidPoll()
 			GUICtrlSetData($lSt, "MQTT: " & ($fMq ? ($iMqSock >= 0 ? "connected to " & $sMqHost & ":" & $iMqPort : "not connected (retry every 30 s)") : "disabled"))
 		EndIf
