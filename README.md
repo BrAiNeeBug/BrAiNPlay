@@ -4,18 +4,19 @@
 
 ### The "Intuitive-Player"
 
-A compact audio & video player for Windows (and Linux via Wine), written in AutoIt, with native MQTT and Home Assistant integration.
+A compact audio & video player for Windows (and Linux via Wine), written in AutoIt, with native MQTT and Home Assistant integration and an optional ffplay engine.
 
-![Version](https://img.shields.io/badge/version-V4-blue)
+![Version](https://img.shields.io/badge/version-V5-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%2FWine-lightgrey)
 ![Language](https://img.shields.io/badge/language-AutoIt3-orange)
 ![MQTT](https://img.shields.io/badge/MQTT-3.1.1-purple)
 ![Home Assistant](https://img.shields.io/badge/Home%20Assistant-discovery-41BDF5)
+![ffplay](https://img.shields.io/badge/engine-MCI%20%7C%20ffplay-green)
 
 <img width="480" height="540" alt="BrAiNPlay main window" src="https://github.com/user-attachments/assets/e7997895-fd8d-466a-a666-6f2227229054" />
 <img width="720" height="452" alt="BrAiNPlay video and playlist" src="https://github.com/user-attachments/assets/c873075b-d791-4b8a-a416-dc8e689220e6" />
 
-[Forum thread](https://www.autoitscript.com/forum/topic/213899-brainplay-intuitiveplayer/) · [Features](#-features) · [MQTT](#-mqtt--home-assistant) · [Shortcuts](#%EF%B8%8F-keyboard-shortcuts) · [History](#-development-history)
+[Forum thread](https://www.autoitscript.com/forum/topic/213899-brainplay-intuitiveplayer/) · [Features](#-features) · [ffplay engine](#-optional-ffplay-engine) · [MQTT](#-mqtt--home-assistant) · [Shortcuts](#%EF%B8%8F-keyboard-shortcuts) · [History](#-development-history)
 
 </div>
 
@@ -27,7 +28,7 @@ A compact audio & video player for Windows (and Linux via Wine), written in Auto
 
 ### 🎵 Audio Player
 
-- MP3, WAV and WMA playback
+- MP3, WAV and WMA playback (many more formats with the optional ffplay engine)
 - Play, pause, stop, previous/next and automatic next track
 - Waveform and seekable playback timeline
 - Volume, stereo balance and mute controls
@@ -43,7 +44,7 @@ A compact audio & video player for Windows (and Linux via Wine), written in Auto
 - Optional click-to-toggle fullscreen/window mode
 - On-screen messages and video controls
 - MCI playback with a Windows Media Player fallback when needed
-- Audio-track selection through the fallback engine when supported
+- Audio-track selection through the fallback engine or ffplay when supported
 
 ### 📂 Playlist
 
@@ -63,11 +64,36 @@ Open it by clicking on the app name.
 - Keep the screen awake during video playback
 - Remember the playlist between sessions
 - Configure video click behavior
+- **Use external ffplay components** (switch, status line and manual update button) *(V5)*
 - Enable and configure MQTT
 - Set the MQTT base topic and Home Assistant discovery prefix
 - Open the log file and configuration folder
 
+**SAVE** stores every setting on the page (switches and MQTT) and closes the window, **CANCEL** discards unsaved changes.
+
 Settings are stored in `%APPDATA%\BrAiNPlay`.
+
+---
+
+## 🧩 Optional ffplay engine
+
+*New in V5.* The classic MCI engine stays the default. If you switch on **Use external ffplay components** in the Options menu, BrAiNPlay downloads ffplay and uses it for playback.
+
+- Plays far more audio and video formats and codecs than MCI / Windows Media Player
+- Automatic download in the background (the player stays usable, MCI plays until ffplay is ready)
+- Stored in `%APPDATA%\BrAiNPlay\ffmpeg\ffplay.exe` and refreshed automatically every 30 days at start-up (or any time with **UPDATE FFPLAY**)
+- Download sources: gyan.dev, with the BtbN GitHub builds as a fallback. Set your own source with `url=` in the `[ffplay]` section of `brainplay.ini`
+- If ffplay is missing or does not start, the player falls back to MCI automatically
+
+How it works inside the player:
+
+- **Audio** runs in a hidden ffplay process
+- **Video** is embedded into the BrAiNPlay video window, so fullscreen, window mode, zoom, monitor selection and the on-screen display work as before
+- Fullscreen and zoom are rendered by ffplay itself (scaled, cropped or letterboxed to the monitor), so videos of any resolution fill the screen
+- ffplay cannot be controlled from the outside, so **seek, volume, balance, zoom and fullscreen/window changes restart ffplay** at the current position (a short gap of about 0.3 s). Volume and balance are applied after the slider is released
+- Pausing an audio track freezes the process, pausing a video restarts it at the same position on resume
+- While an ffplay video is visible, the player keys are registered as global hotkeys (see below), so ffplay never receives them
+- **Linux/Wine:** audio only, video embedding is disabled there. Without the Windows shell tools, place `ffplay.exe` into the `ffmpeg` folder manually
 
 ---
 
@@ -133,7 +159,9 @@ Work even while the player is minimized. They can be disabled independently in t
 | Next track     | Short press: next track · Hold: fast-forward in 5-second steps              |
 | Previous track | Short press: previous track · Hold: rewind in 5-second steps                |
 
-### In video fullscreen (Windows Media Player mode)
+### In video fullscreen (ffplay and Windows Media Player mode)
+
+In these modes the keys work without the player having the focus.
 
 | Key                          | Action                                              |
 |------------------------------|-----------------------------------------------------|
@@ -148,8 +176,18 @@ Work even while the player is minimized. They can be disabled independently in t
 | `F`                          | Toggle video fullscreen                             |
 | `W`                          | Toggle window/fullscreen mode where supported       |
 | `A`                          | Select audio track where supported                  |
-| 😧 Switch video monitor      | If you can't find this key, try `D`                 |
-| `Esc`                        | Close the video display                             |
+| `D`                          | Switch video monitor                                |
+| `Esc`                        | Close the video display (audio keeps playing)       |
+
+### Video zoom (MCI and ffplay)
+
+| Key                          | Action                                              |
+|------------------------------|-----------------------------------------------------|
+| `+` / `Numpad +`             | Zoom in                                             |
+| `-` / `Numpad -`             | Zoom out                                            |
+| `0`                          | Reset zoom                                          |
+
+With the ffplay engine the zoom keys also work while another program has the focus, as long as an ffplay video is visible. Zoom resets to 100 % with every new track.
 
 ---
 
@@ -161,8 +199,9 @@ Work even while the player is minimized. They can be disabled independently in t
 | **V2**  | Video support, dedicated video window, fullscreen/window modes and extended video controls                | Claude     |
 | **V3**  | Native MQTT integration, Home Assistant discovery and a new Options menu                                  | Claude     |
 | **V4**  | Native Linux/Wine compatibility (the design is now a mix of 1984 Windows and 2026 UI style)               | Claude/GPT |
+| **V5**  | Optional ffplay engine (auto-download, 30-day refresh, embedded video, zoom, global hotkeys), Options **SAVE** now saves everything and closes the window | Claude     |
 
-**Last update:** 18.10.2026, 11:50 GMT+1 (Claude) – Fixed player drag
+**Last update:** 28.11.2026 (Claude) – Added the optional ffplay engine
 
 ---
 
