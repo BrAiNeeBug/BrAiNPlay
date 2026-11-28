@@ -14,8 +14,7 @@ A compact audio & video player for Windows (and Linux via Wine), written in Auto
 ![ffplay](https://img.shields.io/badge/engine-MCI%20%7C%20ffplay-green)
 
 <img width="480" height="540" alt="BrAiNPlay main window" src="https://github.com/user-attachments/assets/e7997895-fd8d-466a-a666-6f2227229054" />
-<img width="720" height="452" alt="BrAiNPlay video and playlist" src="https://github.com/user-attachments/assets/b7ffe0f9-d586-4f67-ae5c-69269452dbd2" />
-" />
+<img width="720" height="452" alt="BrAiNPlay settings" src="https://github.com/user-attachments/assets/4fa1c1eb-86f5-4055-8fe1-950a420a7839" />
 
 [Forum thread](https://www.autoitscript.com/forum/topic/213899-brainplay-intuitiveplayer/) · [Features](#-features) · [ffplay engine](#-optional-ffplay-engine) · [MQTT](#-mqtt--home-assistant) · [Shortcuts](#%EF%B8%8F-keyboard-shortcuts) · [History](#-development-history)
 
